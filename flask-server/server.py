@@ -106,6 +106,8 @@ class Supporting:
         if not first_result:
             return None
 
+        Supporting.start_warm(first_result["videoId"])
+
         radio_results = await asyncio.to_thread(
             ytmusic.get_watch_playlist,
             videoId=first_result["videoId"],
@@ -132,6 +134,13 @@ class Supporting:
             ignore_spelling=True,
             limit=25,
         )
+
+        first_playable = next(
+            (track for track in search_results if track.get("videoId")),
+            None,
+        )
+        if first_playable:
+            Supporting.start_warm(first_playable["videoId"])
 
         playlist = [
             metadata
@@ -170,6 +179,9 @@ class Supporting:
             for track in album_results.get("tracks", [])
             if (metadata := Supporting._get_metadata(track)) is not None
         ]
+
+        if playlist:
+            Supporting.start_warm(playlist[0]["video_id"])
 
         return playlist or None
 
@@ -364,12 +376,25 @@ class Supporting:
 
         try:
             with YTDLP_LOCK:
+                # Se o aquecimento terminou enquanto esta requisição aguardava,
+                # usa o cache e evita executar o yt-dlp novamente.
+                if not force_refresh:
+                    cached = Supporting._get_cached_source(video_id)
+                    if cached:
+                        return cached
+
+                started_at = time.time()
                 result = subprocess.run(
                     command,
                     capture_output=True,
                     text=True,
                     timeout=50,
                     check=False,
+                )
+                logger.info(
+                    "yt-dlp concluiu para %s em %.2fs.",
+                    video_id,
+                    time.time() - started_at,
                 )
         except subprocess.TimeoutExpired:
             logger.error("O yt-dlp excedeu o tempo limite para o vídeo %s.", video_id)
