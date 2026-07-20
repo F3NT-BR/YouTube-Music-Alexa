@@ -14,6 +14,8 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("youtube-music-alexa")
 
+COOKIES_PATH = "/etc/secrets/cookies.txt"
+
 
 class Supporting:
     @staticmethod
@@ -172,22 +174,31 @@ class Supporting:
         if not video_id or not re.fullmatch(r"[\w-]{6,20}", video_id):
             return None
 
-        command = [
-            "yt-dlp",
-            "--js-runtimes",
-            "deno",
-            "--no-playlist",
-            "--quiet",
-            "--no-warnings",
-            "--socket-timeout",
-            "20",
-            "--retries",
-            "2",
-            "-f",
-            "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]",
-            "-g",
-            f"https://www.youtube.com/watch?v={video_id}",
-        ]
+        command = ["yt-dlp"]
+
+        if os.path.isfile(COOKIES_PATH):
+            command.extend(["--cookies", COOKIES_PATH])
+            logger.info("Usando cookies do arquivo secreto do Render.")
+        else:
+            logger.warning("Arquivo de cookies não encontrado em %s.", COOKIES_PATH)
+
+        command.extend(
+            [
+                "--js-runtimes",
+                "deno",
+                "--no-playlist",
+                "--quiet",
+                "--no-warnings",
+                "--socket-timeout",
+                "20",
+                "--retries",
+                "2",
+                "-f",
+                "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]",
+                "-g",
+                f"https://www.youtube.com/watch?v={video_id}",
+            ]
+        )
 
         try:
             result = await asyncio.to_thread(
@@ -211,6 +222,7 @@ class Supporting:
 
         urls = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if not urls:
+            logger.error("O yt-dlp não retornou nenhuma URL de áudio.")
             return None
 
         return {"audio_url": urls[0]}
