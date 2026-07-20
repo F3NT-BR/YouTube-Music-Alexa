@@ -1,0 +1,4 @@
+Flask[async]
+gunicorn
+ytmusicapi
+yt-dlp[default]
