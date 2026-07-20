@@ -2,7 +2,9 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import subprocess
+import threading
 import time
 from urllib.parse import parse_qs, urlparse
 
@@ -14,7 +16,9 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("youtube-music-alexa")
 
-COOKIES_PATH = "/etc/secrets/cookies.txt"
+COOKIES_SOURCE_PATH = "/etc/secrets/cookies.txt"
+COOKIES_WORK_PATH = "/tmp/youtube-cookies.txt"
+COOKIES_LOCK = threading.Lock()
 
 
 class Supporting:
@@ -170,17 +174,40 @@ class Supporting:
         }
 
     @staticmethod
+    def _prepare_writable_cookies():
+        if not os.path.isfile(COOKIES_SOURCE_PATH):
+            logger.warning(
+                "Arquivo secreto de cookies não encontrado em %s.",
+                COOKIES_SOURCE_PATH,
+            )
+            return None
+
+        try:
+            if not os.path.isfile(COOKIES_WORK_PATH):
+                shutil.copyfile(COOKIES_SOURCE_PATH, COOKIES_WORK_PATH)
+                os.chmod(COOKIES_WORK_PATH, 0o600)
+                logger.info(
+                    "Cookies copiados do segredo do Render para o diretório gravável."
+                )
+
+            return COOKIES_WORK_PATH
+        except OSError:
+            logger.exception("Não foi possível preparar a cópia gravável dos cookies.")
+            return None
+
+    @staticmethod
     async def get_stream(video_id: str):
         if not video_id or not re.fullmatch(r"[\w-]{6,20}", video_id):
             return None
 
+        cookies_path = Supporting._prepare_writable_cookies()
         command = ["yt-dlp"]
 
-        if os.path.isfile(COOKIES_PATH):
-            command.extend(["--cookies", COOKIES_PATH])
-            logger.info("Usando cookies do arquivo secreto do Render.")
+        if cookies_path:
+            command.extend(["--cookies", cookies_path])
+            logger.info("Usando a cópia gravável dos cookies.")
         else:
-            logger.warning("Arquivo de cookies não encontrado em %s.", COOKIES_PATH)
+            logger.warning("Executando o yt-dlp sem cookies.")
 
         command.extend(
             [
@@ -201,14 +228,18 @@ class Supporting:
         )
 
         try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                command,
-                capture_output=True,
-                text=True,
-                timeout=45,
-                check=False,
-            )
+            def run_yt_dlp():
+                # Evita que duas requisições tentem atualizar o mesmo cookie jar ao mesmo tempo.
+                with COOKIES_LOCK:
+                    return subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        timeout=45,
+                        check=False,
+                    )
+
+            result = await asyncio.to_thread(run_yt_dlp)
         except subprocess.TimeoutExpired:
             logger.error("O yt-dlp excedeu o tempo limite para o vídeo %s.", video_id)
             return None
