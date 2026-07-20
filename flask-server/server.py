@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -8,17 +9,42 @@ import threading
 import time
 from urllib.parse import parse_qs, urlparse
 
-from flask import Flask, jsonify, render_template, request
+import requests
+from flask import (
+    Flask,
+    Response,
+    jsonify,
+    render_template,
+    request,
+    stream_with_context,
+)
+from werkzeug.middleware.proxy_fix import ProxyFix
 from ytmusicapi import YTMusic
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("youtube-music-alexa")
 
 COOKIES_SOURCE_PATH = "/etc/secrets/cookies.txt"
 COOKIES_WORK_PATH = "/tmp/youtube-cookies.txt"
-COOKIES_LOCK = threading.Lock()
+
+YTDLP_LOCK = threading.Lock()
+SOURCE_CACHE_LOCK = threading.Lock()
+SOURCE_CACHE = {}
+SOURCE_CACHE_TTL_SECONDS = 240
+
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+}
 
 
 class Supporting:
@@ -161,7 +187,39 @@ class Supporting:
         if not playlist:
             return None
 
-        stream = await Supporting.get_stream(playlist[0]["video_id"])
+        stream = Supporting.get_proxy_stream(playlist[0]["video_id"])
+
+        return {
+            "song_info": {
+                "metadata": playlist[0],
+                "stream": stream,
+            },
+            "playlist": playlist,
+        }
+
+    @staticmethod
+    def get_proxy_stream(video_id: str):
+        if not video_id or not re.fullmatch(r"[\w-]{6,20}", video_id):
+            return None
+
+        base_url = request.url_root.rstrip("/")
+        return {"audio_url": f"{base_url}/audio/{video_id}"}
+
+    @staticmethod
+    async def find_stream_list(query: str, filter_name: str = "songs"):
+        if filter_name == "songs":
+            playlist = await Supporting.get_radiolist(query)
+        elif filter_name == "artists":
+            playlist = await Supporting.get_artist(query)
+        elif filter_name == "albums":
+            playlist = await Supporting.get_album(query)
+        else:
+            return None
+
+        if not playlist:
+            return None
+
+        stream = Supporting.get_proxy_stream(playlist[0]["video_id"])
         if not stream:
             return None
 
@@ -196,11 +254,45 @@ class Supporting:
             return None
 
     @staticmethod
-    async def get_stream(video_id: str):
-        if not video_id or not re.fullmatch(r"[\w-]{6,20}", video_id):
+    def _get_cached_source(video_id: str):
+        now = time.time()
+
+        with SOURCE_CACHE_LOCK:
+            cached = SOURCE_CACHE.get(video_id)
+            if not cached:
+                return None
+
+            if now - cached["created_at"] > SOURCE_CACHE_TTL_SECONDS:
+                SOURCE_CACHE.pop(video_id, None)
+                return None
+
+            return cached["source"]
+
+    @staticmethod
+    def _cache_source(video_id: str, source: dict):
+        with SOURCE_CACHE_LOCK:
+            SOURCE_CACHE[video_id] = {
+                "created_at": time.time(),
+                "source": source,
+            }
+
+    @staticmethod
+    def _invalidate_source(video_id: str):
+        with SOURCE_CACHE_LOCK:
+            SOURCE_CACHE.pop(video_id, None)
+
+    @staticmethod
+    def resolve_audio_source(video_id: str, force_refresh: bool = False):
+        if not re.fullmatch(r"[\w-]{6,20}", video_id or ""):
             return None
 
+        if not force_refresh:
+            cached = Supporting._get_cached_source(video_id)
+            if cached:
+                return cached
+
         cookies_path = Supporting._prepare_writable_cookies()
+
         command = ["yt-dlp"]
 
         if cookies_path:
@@ -221,25 +313,21 @@ class Supporting:
                 "--retries",
                 "2",
                 "-f",
-                "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]",
-                "-g",
+                "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio",
+                "--dump-single-json",
                 f"https://www.youtube.com/watch?v={video_id}",
             ]
         )
 
         try:
-            def run_yt_dlp():
-                # Evita que duas requisições tentem atualizar o mesmo cookie jar ao mesmo tempo.
-                with COOKIES_LOCK:
-                    return subprocess.run(
-                        command,
-                        capture_output=True,
-                        text=True,
-                        timeout=45,
-                        check=False,
-                    )
-
-            result = await asyncio.to_thread(run_yt_dlp)
+            with YTDLP_LOCK:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=50,
+                    check=False,
+                )
         except subprocess.TimeoutExpired:
             logger.error("O yt-dlp excedeu o tempo limite para o vídeo %s.", video_id)
             return None
@@ -251,38 +339,44 @@ class Supporting:
             logger.error("Erro do yt-dlp: %s", result.stderr.strip())
             return None
 
-        urls = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        if not urls:
-            logger.error("O yt-dlp não retornou nenhuma URL de áudio.")
+        try:
+            info = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            logger.error("O yt-dlp retornou um JSON inválido.")
             return None
 
-        return {"audio_url": urls[0]}
+        source_url = info.get("url")
+        source_headers = info.get("http_headers") or {}
 
-    @staticmethod
-    async def find_stream_list(query: str, filter_name: str = "songs"):
-        if filter_name == "songs":
-            playlist = await Supporting.get_radiolist(query)
-        elif filter_name == "artists":
-            playlist = await Supporting.get_artist(query)
-        elif filter_name == "albums":
-            playlist = await Supporting.get_album(query)
-        else:
+        if not source_url:
+            requested_formats = info.get("requested_formats") or []
+            selected = next(
+                (
+                    item
+                    for item in requested_formats
+                    if item.get("url") and item.get("acodec") != "none"
+                ),
+                None,
+            )
+            if selected:
+                source_url = selected.get("url")
+                source_headers = selected.get("http_headers") or source_headers
+
+        if not source_url:
+            logger.error("O yt-dlp não retornou uma URL de áudio.")
             return None
 
-        if not playlist:
-            return None
-
-        stream = await Supporting.get_stream(playlist[0]["video_id"])
-        if not stream:
-            return None
-
-        return {
-            "song_info": {
-                "metadata": playlist[0],
-                "stream": stream,
+        source = {
+            "url": source_url,
+            "headers": {
+                str(key): str(value)
+                for key, value in source_headers.items()
+                if value is not None
             },
-            "playlist": playlist,
         }
+
+        Supporting._cache_source(video_id, source)
+        return source
 
     @staticmethod
     def playlist_url_to_id(value: str):
@@ -331,10 +425,97 @@ class Supporting:
         }
 
 
+def _request_upstream(source: dict):
+    upstream_headers = {
+        key: value
+        for key, value in source["headers"].items()
+        if key.lower() not in HOP_BY_HOP_HEADERS
+    }
+
+    upstream_headers["Accept-Encoding"] = "identity"
+
+    range_header = request.headers.get("Range")
+    if range_header:
+        upstream_headers["Range"] = range_header
+
+    if_range_header = request.headers.get("If-Range")
+    if if_range_header:
+        upstream_headers["If-Range"] = if_range_header
+
+    return requests.get(
+        source["url"],
+        headers=upstream_headers,
+        stream=True,
+        allow_redirects=True,
+        timeout=(15, 90),
+    )
+
+
 @app.route("/", methods=["GET"])
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "youtube-music-alexa"})
+
+
+@app.route("/audio/<video_id>", methods=["GET", "HEAD"])
+def audio_proxy(video_id: str):
+    source = Supporting.resolve_audio_source(video_id)
+    if not source:
+        return jsonify({"error": "Não foi possível preparar o áudio."}), 502
+
+    try:
+        upstream = _request_upstream(source)
+
+        if upstream.status_code in {401, 403, 410}:
+            upstream.close()
+            Supporting._invalidate_source(video_id)
+
+            source = Supporting.resolve_audio_source(video_id, force_refresh=True)
+            if not source:
+                return jsonify({"error": "Não foi possível renovar o áudio."}), 502
+
+            upstream = _request_upstream(source)
+    except requests.RequestException:
+        logger.exception("Erro ao conectar ao servidor de áudio.")
+        return jsonify({"error": "Falha ao conectar ao servidor de áudio."}), 502
+
+    response_headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Accept-Ranges": upstream.headers.get("Accept-Ranges", "bytes"),
+        "Cache-Control": "private, no-store",
+    }
+
+    for header_name in (
+        "Content-Type",
+        "Content-Length",
+        "Content-Range",
+        "ETag",
+        "Last-Modified",
+    ):
+        header_value = upstream.headers.get(header_name)
+        if header_value:
+            response_headers[header_name] = header_value
+
+    if request.method == "HEAD":
+        status_code = upstream.status_code
+        upstream.close()
+        return Response(status=status_code, headers=response_headers)
+
+    @stream_with_context
+    def generate():
+        try:
+            for chunk in upstream.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+
+    return Response(
+        generate(),
+        status=upstream.status_code,
+        headers=response_headers,
+        direct_passthrough=True,
+    )
 
 
 @app.route("/get_playlist_info/", methods=["GET"])
@@ -379,11 +560,11 @@ async def get_stream():
     if not video_id:
         return jsonify({"error": "Parâmetro video_id ausente."}), 400
 
-    response = await Supporting.get_stream(video_id)
+    response = Supporting.get_proxy_stream(video_id)
     logger.info("get_stream concluído em %.2fs", time.time() - start_time)
 
     if not response:
-        return jsonify({"error": "Não foi possível obter o áudio."}), 502
+        return jsonify({"error": "ID de vídeo inválido."}), 400
 
     return jsonify(response)
 
@@ -401,7 +582,7 @@ async def find_stream_list():
     logger.info("find_stream_list concluído em %.2fs", time.time() - start_time)
 
     if not response:
-        return jsonify({"error": "Nenhuma música reproduzível foi encontrada."}), 502
+        return jsonify({"error": "Nenhuma música foi encontrada."}), 404
 
     return jsonify(response)
 
