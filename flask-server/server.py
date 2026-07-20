@@ -16,6 +16,7 @@ from flask import (
     jsonify,
     render_template,
     request,
+    send_file,
     stream_with_context,
 )
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -33,7 +34,11 @@ COOKIES_WORK_PATH = "/tmp/youtube-cookies.txt"
 YTDLP_LOCK = threading.Lock()
 SOURCE_CACHE_LOCK = threading.Lock()
 SOURCE_CACHE = {}
-SOURCE_CACHE_TTL_SECONDS = 240
+SOURCE_CACHE_TTL_SECONDS = 3600
+
+WARMING_LOCK = threading.Lock()
+WARMING_VIDEO_IDS = set()
+LOADING_AUDIO_PATH = os.path.join(os.path.dirname(__file__), "loading.mp3")
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -187,6 +192,7 @@ class Supporting:
         if not playlist:
             return None
 
+        Supporting.start_warm(playlist[0]["video_id"])
         stream = Supporting.get_proxy_stream(playlist[0]["video_id"])
 
         return {
@@ -219,6 +225,7 @@ class Supporting:
         if not playlist:
             return None
 
+        Supporting.start_warm(playlist[0]["video_id"])
         stream = Supporting.get_proxy_stream(playlist[0]["video_id"])
         if not stream:
             return None
@@ -280,6 +287,42 @@ class Supporting:
     def _invalidate_source(video_id: str):
         with SOURCE_CACHE_LOCK:
             SOURCE_CACHE.pop(video_id, None)
+
+    @staticmethod
+    def is_source_ready(video_id: str):
+        return Supporting._get_cached_source(video_id) is not None
+
+    @staticmethod
+    def _warm_worker(video_id: str):
+        try:
+            Supporting.resolve_audio_source(video_id)
+        finally:
+            with WARMING_LOCK:
+                WARMING_VIDEO_IDS.discard(video_id)
+
+    @staticmethod
+    def start_warm(video_id: str):
+        if not re.fullmatch(r"[\w-]{6,20}", video_id or ""):
+            return False
+
+        if Supporting.is_source_ready(video_id):
+            return True
+
+        with WARMING_LOCK:
+            if video_id in WARMING_VIDEO_IDS:
+                return True
+
+            WARMING_VIDEO_IDS.add(video_id)
+
+        thread = threading.Thread(
+            target=Supporting._warm_worker,
+            args=(video_id,),
+            daemon=True,
+            name=f"warm-{video_id}",
+        )
+        thread.start()
+        logger.info("Aquecimento iniciado para o vídeo %s.", video_id)
+        return True
 
     @staticmethod
     def resolve_audio_source(video_id: str, force_refresh: bool = False):
@@ -455,6 +498,39 @@ def _request_upstream(source: dict):
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "youtube-music-alexa"})
+
+
+@app.route("/loading.mp3", methods=["GET", "HEAD"])
+def loading_audio():
+    if not os.path.isfile(LOADING_AUDIO_PATH):
+        return jsonify({"error": "Áudio de carregamento não encontrado."}), 404
+
+    return send_file(
+        LOADING_AUDIO_PATH,
+        mimetype="audio/mpeg",
+        conditional=True,
+        max_age=3600,
+    )
+
+
+@app.route("/warm/<video_id>", methods=["GET", "POST"])
+def warm_audio(video_id: str):
+    if not re.fullmatch(r"[\w-]{6,20}", video_id or ""):
+        return jsonify({"error": "ID de vídeo inválido."}), 400
+
+    if Supporting.is_source_ready(video_id):
+        return jsonify({"status": "ready", "ready": True})
+
+    Supporting.start_warm(video_id)
+    return jsonify({"status": "warming", "ready": False}), 202
+
+
+@app.route("/ready/<video_id>", methods=["GET"])
+def audio_ready(video_id: str):
+    if not re.fullmatch(r"[\w-]{6,20}", video_id or ""):
+        return jsonify({"error": "ID de vídeo inválido."}), 400
+
+    return jsonify({"ready": Supporting.is_source_ready(video_id)})
 
 
 @app.route("/audio/<video_id>", methods=["GET", "HEAD"])
